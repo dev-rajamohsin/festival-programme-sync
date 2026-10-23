@@ -1,0 +1,10 @@
+# Recurring background jobs, loaded by sidekiq-cron (see config/initializers/sidekiq.rb).
+#
+# NOTE: an hourly *full* sync is a blunt instrument for time-sensitive
+# programming data — see the README. It's the safe default here; the real fix is
+# event-driven updates (webhooks) from the upstream system.
+programme_sync:
+  cron: "0 * * * *"        # top of every hour
+  class: "ProgrammeSyncJob"
+  queue: default
+  description: "Pull the festival programme (generation 1) into our local copy"

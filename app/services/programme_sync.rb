@@ -25,9 +25,7 @@ class ProgrammeSync
     @client     = client
   end
 
-  # Returns the SyncRun. Re-raises FestivalApi::Error after recording it, so a
-  # background job can see the failure and retry; per-record data errors are
-  # captured on the run and never raised.
+
   def call
     run = SyncRun.create!(status: :running, generation: @generation, started_at: Time.current)
 
@@ -37,8 +35,7 @@ class ProgrammeSync
       end
       run.status = :succeeded
     rescue FestivalApi::Error => e
-      # Upstream failed partway. Everything imported before this point is already
-      # committed; record why we stopped and let the caller decide about retrying.
+
       run.status        = :failed
       run.error_message = e.message
       raise
@@ -53,9 +50,6 @@ class ProgrammeSync
   private
 
   def import_record(record, run)
-    # requires_new wraps each record in its own savepoint, so one failure rolls
-    # back only that record (film + venue + screening together) and the rest of
-    # the page still commits.
     ApplicationRecord.transaction(requires_new: true) do
       film  = upsert_film(record.fetch("film"))
       venue = upsert_venue(record.fetch("venue"))
@@ -63,8 +57,7 @@ class ProgrammeSync
       created ? run.created_count += 1 : run.updated_count += 1
     end
   rescue StandardError => e
-    # A bad individual record (missing field, invalid data) — distinct from a dead
-    # API. Capture it and keep going.
+
     run.failed_count += 1
     run.record_errors << { "external_id" => record["id"], "error" => e.message }
     Rails.logger.warn("[ProgrammeSync] skipped record #{record['id'].inspect}: #{e.message}")
@@ -93,8 +86,6 @@ class ProgrammeSync
     venue
   end
 
-  # Returns true if a new screening was inserted, false if an existing one was
-  # matched (and possibly updated).
   def upsert_screening(record, film, venue)
     screening = Screening.find_or_initialize_by(external_id: record.fetch("id"))
     created   = screening.new_record?
