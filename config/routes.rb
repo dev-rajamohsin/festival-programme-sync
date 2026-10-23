@@ -15,6 +15,7 @@ Rails.application.routes.draw do
 
   # Sidekiq's web dashboard, handy for watching the sync job run.
   require "sidekiq/web"
+  require "sidekiq/cron/web"
   mount Sidekiq::Web => "/sidekiq"
 
   # Defines the root path route ("/")
