@@ -1,12 +1,22 @@
 # Pulls the festival programme (screenings, with their nested films and venues)
 # from the external API into our local copy.
 #
-# Reliability here is idempotency: every record is upserted on its EXTERNAL id,
-# never on a human-readable field, so running the sync twice creates no
-# duplicates, and a retitled film or renamed venue updates the existing row
-# instead of forking a second one.
+# Design goals, in priority order:
 #
-#   ProgrammeSync.call(generation: 1)
+#   * Idempotent. Every record is upserted on its EXTERNAL id, never on a
+#     human-readable field, so running twice creates no duplicates and a retitled
+#     film or renamed venue updates the existing row instead of forking it.
+#
+#   * Correct under partial failure. Each record is imported in its own
+#     transaction, so a single bad record is isolated and reported without
+#     abandoning the batch, and whatever already succeeded stays committed. If the
+#     upstream API itself dies partway, the pages we already imported are kept and
+#     the run is marked failed so the job can retry.
+#
+#   * Observable. Every run is recorded in a SyncRun: status, timing, created /
+#     updated / failed counts, and the captured per-record errors.
+#
+#   ProgrammeSync.call(generation: 1)   #=> #<SyncRun status: "succeeded", ...>
 class ProgrammeSync
   def self.call(...) = new(...).call
 
@@ -15,18 +25,49 @@ class ProgrammeSync
     @client     = client
   end
 
+  # Returns the SyncRun. Re-raises FestivalApi::Error after recording it, so a
+  # background job can see the failure and retry; per-record data errors are
+  # captured on the run and never raised.
   def call
-    @client.each_page(generation: @generation) do |body|
-      Array(body["screenings"]).each { |record| import_record(record) }
+    run = SyncRun.create!(status: :running, generation: @generation, started_at: Time.current)
+
+    begin
+      @client.each_page(generation: @generation) do |body|
+        Array(body["screenings"]).each { |record| import_record(record, run) }
+      end
+      run.status = :succeeded
+    rescue FestivalApi::Error => e
+      # Upstream failed partway. Everything imported before this point is already
+      # committed; record why we stopped and let the caller decide about retrying.
+      run.status        = :failed
+      run.error_message = e.message
+      raise
+    ensure
+      run.finished_at = Time.current
+      run.save!
     end
+
+    run
   end
 
   private
 
-  def import_record(record)
-    film  = upsert_film(record.fetch("film"))
-    venue = upsert_venue(record.fetch("venue"))
-    upsert_screening(record, film, venue)
+  def import_record(record, run)
+    # requires_new wraps each record in its own savepoint, so one failure rolls
+    # back only that record (film + venue + screening together) and the rest of
+    # the page still commits.
+    ApplicationRecord.transaction(requires_new: true) do
+      film  = upsert_film(record.fetch("film"))
+      venue = upsert_venue(record.fetch("venue"))
+      created = upsert_screening(record, film, venue)
+      created ? run.created_count += 1 : run.updated_count += 1
+    end
+  rescue StandardError => e
+    # A bad individual record (missing field, invalid data) — distinct from a dead
+    # API. Capture it and keep going.
+    run.failed_count += 1
+    run.record_errors << { "external_id" => record["id"], "error" => e.message }
+    Rails.logger.warn("[ProgrammeSync] skipped record #{record['id'].inspect}: #{e.message}")
   end
 
   def upsert_film(attrs)
@@ -52,8 +93,11 @@ class ProgrammeSync
     venue
   end
 
+  # Returns true if a new screening was inserted, false if an existing one was
+  # matched (and possibly updated).
   def upsert_screening(record, film, venue)
     screening = Screening.find_or_initialize_by(external_id: record.fetch("id"))
+    created   = screening.new_record?
     screening.assign_attributes(
       film:      film,
       venue:     venue,
@@ -61,6 +105,6 @@ class ProgrammeSync
       status:    record.fetch("status")
     )
     screening.save! if screening.changed?
-    screening
+    created
   end
 end

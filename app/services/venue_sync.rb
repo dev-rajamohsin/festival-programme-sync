@@ -11,19 +11,26 @@
 # NOTE: this originally matched on `name`, which meant an upstream rename created
 # a *second* venue row instead of updating the first — the classic "matched on a
 # human-readable field" integration bug. It now upserts on the external id, which
-# is stable across renames.
+# is stable across renames, and isolates a bad record so one failure doesn't
+# abandon the rest of the batch. Returns the venue hashes it couldn't import.
 class VenueSync
   def initialize(venues)
     @venues = venues
   end
 
   def call
+    failures = []
+
     @venues.each do |attrs|
       venue = Venue.find_or_initialize_by(external_id: attrs.fetch("id"))
       venue.name     = attrs.fetch("name")
       venue.address  = attrs["address"]
       venue.capacity = attrs["capacity"]
       venue.save!
+    rescue StandardError => e
+      failures << { attrs: attrs, error: e.message }
     end
+
+    failures
   end
 end
